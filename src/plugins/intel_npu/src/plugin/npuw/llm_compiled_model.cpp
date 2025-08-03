@@ -951,6 +951,9 @@ ov::AnyMap get_default_generate_config(const std::optional<NPUDesc>& npudesc,
     if (hint == ::intel_npu::npuw::llm::GenerateHint::FAST_COMPILE) {
         config.emplace("NPUW_UNFOLD_IREQS", "YES");
     }
+    // We don't need slice out for kv cache model, especially for speculative decoding which need
+    // to generate more than 1 token for each inference
+    config.erase("NPUW_SLICE_OUT");
     return config;
 }
 
@@ -1057,6 +1060,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     KVAxesPosition axes{batch_dim, seq_len_dim};
     const uint32_t max_prompt_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MAX_PROMPT_LEN>(), 64u);
     const uint32_t min_response_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MIN_RESPONSE_LEN>(), 64u);
+    const uint32_t max_generation_token_len = m_cfg.get<::intel_npu::NPUW_LLM_MAX_GENERATION_TOKEN_LEN>();
 
     m_prefill_chunk_size = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>();
     const bool use_chunk_prefill = m_prefill_chunk_size > 0;
@@ -1083,7 +1087,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         }
     }
 
-    m_kvcache_desc = KVCacheDesc{max_prompt_len, max_prompt_len + min_response_len, 0u, seq_len_dim};
+    m_kvcache_desc =
+        KVCacheDesc{max_prompt_len, max_prompt_len + min_response_len, 0u, seq_len_dim, max_generation_token_len};
     LOG_DEBUG("Make prefill model with static shapes");
     if (use_chunk_prefill) {
         reshape_to_static(prefill_model,
@@ -1094,7 +1099,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         reshape_to_static(prefill_model, m_kvcache_desc.max_prompt_size, m_kvcache_desc.max_prompt_size, axes);
     }
     LOG_DEBUG("Make kvcache model with static shapes");
-    reshape_to_static(kvcache_model, 1u, m_kvcache_desc.total_size, axes);
+    reshape_to_static(kvcache_model, m_kvcache_desc.max_generation_token_len, m_kvcache_desc.total_size, axes);
     if (lm_head_model) {
         LOG_DEBUG("Shared LM head: slice the prefill output");
         // KVCache model is already reshaped to [1, 1, embed size], so only apply slice to
