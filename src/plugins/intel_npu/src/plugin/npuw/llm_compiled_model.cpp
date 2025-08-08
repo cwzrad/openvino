@@ -773,7 +773,8 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
     model->reshape(new_shapes);
 }
 
-void reshape_sliced_head_to_static(std::shared_ptr<ov::Model> lm_head_model, const uint32_t& batch_dim,
+void reshape_sliced_head_to_static(std::shared_ptr<ov::Model> lm_head_model,
+                                   const uint32_t& batch_dim,
                                    std::size_t max_generation_token_len) {
     // We have only one input with dynamic shapes: output embeds.
     // Output embeds should have "max_generation_token_len" for dimension representing number of embeddings
@@ -797,7 +798,8 @@ void reshape_sliced_head_to_static(std::shared_ptr<ov::Model> lm_head_model, con
     lm_head_model->reshape(new_shape);
 }
 
-void slice_out_embeds(std::shared_ptr<ov::Model> model, const uint32_t& batch_dim,
+void slice_out_embeds(std::shared_ptr<ov::Model> model,
+                      const uint32_t& batch_dim,
                       std::size_t max_generation_token_len) {
     std::shared_ptr<ov::Node> embed_result;
     for (auto&& output : model->outputs()) {
@@ -815,9 +817,10 @@ void slice_out_embeds(std::shared_ptr<ov::Model> model, const uint32_t& batch_di
         if (shape.size() == 3) {
             uint32_t num_embeds_dim = 1 - batch_dim;
             if (shape[num_embeds_dim] > 1) {
-                std::vector<int32_t> start_pos{static_cast<int32_t>(batch_dim * (shape[num_embeds_dim] - max_generation_token_len)),
-                                               static_cast<int32_t>(num_embeds_dim * (shape[num_embeds_dim] - max_generation_token_len)),
-                                               0};
+                std::vector<int32_t> start_pos{
+                    static_cast<int32_t>(batch_dim * (shape[num_embeds_dim] - max_generation_token_len)),
+                    static_cast<int32_t>(num_embeds_dim * (shape[num_embeds_dim] - max_generation_token_len)),
+                    0};
                 std::vector<int32_t> stop_pos{static_cast<int32_t>(batch_dim * (shape[num_embeds_dim] - 1)) + 1,
                                               static_cast<int32_t>(num_embeds_dim * (shape[num_embeds_dim] - 1)) + 1,
                                               static_cast<int32_t>(shape[2])};
