@@ -12,9 +12,22 @@
 #include "intel_npu/config/options.hpp"
 #include "intel_npu/utils/logger/logger.hpp"
 #include "openvino/openvino.hpp"
+#include "openvino/pass/matcher_pass.hpp"
 #include "openvino/runtime/intel_npu/properties.hpp"
 
 namespace intel_npu {
+
+namespace pass {
+
+class OneHotMatMulToGather : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("intel_npu::pass::OneHotMatMulToGather");
+    OneHotMatMulToGather();
+};
+
+}  // namespace pass
+
+bool run_npu_graph_transformations(const std::shared_ptr<ov::Model>& model);
 
 /**
  * @brief Decides whether a model with at least one dynamic non-batch dimension (bounded or unbounded) in its inputs

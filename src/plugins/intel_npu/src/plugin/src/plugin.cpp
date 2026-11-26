@@ -251,7 +251,9 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model(const std::shared_ptr<
     ov::AnyMap localProperties = properties;
     if (localProperties.count(useNpuwKey)) {
         if (localProperties.at(useNpuwKey).as<bool>() == true) {
-            return ov::npuw::ICompiledModel::create(model->clone(), shared_from_this(), localProperties);
+            auto npuwModel = model->clone();
+            intel_npu::run_npu_graph_transformations(npuwModel);
+            return ov::npuw::ICompiledModel::create(std::move(npuwModel), shared_from_this(), localProperties);
         } else {
             // NPUW is disabled, remove the key from the properties
             localProperties.erase(useNpuwKey);
@@ -262,7 +264,9 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model(const std::shared_ptr<
                      "automatically.");
         auto npuwProperties = localProperties;
         npuwProperties[useNpuwKey] = true;
-        return ov::npuw::ICompiledModel::create(model->clone(), shared_from_this(), npuwProperties);
+        auto npuwModel = model->clone();
+        intel_npu::run_npu_graph_transformations(npuwModel);
+        return ov::npuw::ICompiledModel::create(std::move(npuwModel), shared_from_this(), npuwProperties);
     }
 
     // DEVICE_ID can be passed both as an index and as a platform name.
@@ -435,6 +439,7 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model(const std::shared_ptr<
 
         // Determine which model to use
         auto modelToCompile = successfullyDebatched ? std::move(batchedModel) : model->clone();
+        intel_npu::run_npu_graph_transformations(modelToCompile);
 
         const bool performanceHintSetByUser = localConfig.has(ov::hint::performance_mode.name());
         const bool shouldForceThroughput = successfullyDebatched && !performanceHintSetByUser;

@@ -185,6 +185,7 @@ install(TARGETS ${TARGET_NAME}
 
 target_sources(${TARGET_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/npu/executor_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/npu/onehot_matmul_to_gather_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npu/should_use_host_compile_interpreter_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npu/compiler_option_support_helper_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npu/device_helpers_test.cpp

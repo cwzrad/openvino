@@ -6,14 +6,229 @@
 
 #include <algorithm>
 #include <map>
+#include <optional>
 #include <sstream>
+#include <typeinfo>
+#include <vector>
 
+#include "openvino/core/graph_util.hpp"
 #include "intel_npu/utils/utils.hpp"
 #include "openvino/core/layout.hpp"
+#include "openvino/core/rt_info.hpp"
+#include "openvino/op/ops.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/pass/manager.hpp"
+#include "openvino/pass/pattern/matcher.hpp"
+#include "openvino/pass/pattern/op/wrap_type.hpp"
+
+#define MATCHER_SCOPE(region) const std::string matcher_name = std::string(typeid(*this).name()) + "_" #region
 
 namespace intel_npu {
+
+namespace {
+
+std::optional<int64_t> get_integer_scalar(const ov::Output<ov::Node>& value) {
+    const auto constant = ov::as_type_ptr<ov::op::v0::Constant>(value.get_node_shared_ptr());
+    if (!constant || !constant->get_shape().empty()) {
+        return std::nullopt;
+    }
+    if (constant->get_element_type() == ov::element::i64) {
+        return constant->cast_vector<int64_t>().front();
+    }
+    if (constant->get_element_type() == ov::element::i32) {
+        return constant->cast_vector<int32_t>().front();
+    }
+    return std::nullopt;
+}
+
+std::optional<std::vector<int64_t>> get_integer_vector(const ov::Output<ov::Node>& value) {
+    const auto constant = ov::as_type_ptr<ov::op::v0::Constant>(value.get_node_shared_ptr());
+    if (!constant) {
+        return std::nullopt;
+    }
+    if (constant->get_element_type() == ov::element::i64) {
+        return constant->cast_vector<int64_t>();
+    }
+    if (constant->get_element_type() == ov::element::i32) {
+        const auto values = constant->cast_vector<int32_t>();
+        return std::vector<int64_t>(values.begin(), values.end());
+    }
+    return std::nullopt;
+}
+
+bool is_integer_index_type(const ov::element::Type& type) {
+    return type == ov::element::i32 || type == ov::element::i64;
+}
+
+}  // namespace
+
+namespace pass {
+
+OneHotMatMulToGather::OneHotMatMulToGather() {
+    MATCHER_SCOPE(OneHotMatMulToGather);
+
+    using namespace ov::pass::pattern;
+    const auto one_hot = wrap_type<ov::op::v1::OneHot>();
+    const auto one_hot_convert = wrap_type<ov::op::v0::Convert>({one_hot});
+    const auto transpose = wrap_type<ov::op::v1::Transpose>({one_hot_convert, any_input()});
+    const auto matmul = wrap_type<ov::op::v0::MatMul>({transpose, any_input()});
+
+    const ov::matcher_pass_callback callback = [one_hot, one_hot_convert, transpose](ov::pass::pattern::Matcher& matcher) {
+        const auto& pattern_map = matcher.get_pattern_value_map();
+        const auto one_hot_node = ov::as_type_ptr<ov::op::v1::OneHot>(pattern_map.at(one_hot).get_node_shared_ptr());
+        const auto one_hot_convert_node =
+            ov::as_type_ptr<ov::op::v0::Convert>(pattern_map.at(one_hot_convert).get_node_shared_ptr());
+        const auto transpose_node =
+            ov::as_type_ptr<ov::op::v1::Transpose>(pattern_map.at(transpose).get_node_shared_ptr());
+        const auto matmul_node = ov::as_type_ptr<ov::op::v0::MatMul>(matcher.get_match_root());
+
+        if (one_hot_node->get_axis() != 3 || matmul_node->get_transpose_a() || matmul_node->get_transpose_b()) {
+            return false;
+        }
+
+        const auto indices = one_hot_node->input_value(0);
+        const auto index_shape = indices.get_partial_shape();
+        if (!is_integer_index_type(indices.get_element_type()) || !index_shape.rank().is_static() ||
+            index_shape.rank().get_length() != 3 || !index_shape[2].is_static()) {
+            return false;
+        }
+
+        const auto depth = get_integer_scalar(one_hot_node->input_value(1));
+        const auto on_value = get_integer_scalar(one_hot_node->input_value(2));
+        const auto off_value = get_integer_scalar(one_hot_node->input_value(3));
+        if (!depth || !on_value || !off_value || *depth <= 0 || *on_value != 1 || *off_value != 0) {
+            return false;
+        }
+
+        const auto permutation = get_integer_vector(transpose_node->input_value(1));
+        if (!permutation || *permutation != std::vector<int64_t>{0, 2, 1, 3}) {
+            return false;
+        }
+
+        const auto table_convert =
+            ov::as_type_ptr<ov::op::v0::Convert>(matmul_node->input_value(1).get_node_shared_ptr());
+        if (!table_convert) {
+            return false;
+        }
+        const auto multiply =
+            ov::as_type_ptr<ov::op::v1::Multiply>(table_convert->input_value(0).get_node_shared_ptr());
+        if (!multiply) {
+            return false;
+        }
+
+        ov::Output<ov::Node> scale_output;
+        auto weight_convert = ov::as_type_ptr<ov::op::v0::Convert>(multiply->input_value(0).get_node_shared_ptr());
+        auto scale = ov::as_type_ptr<ov::op::v0::Constant>(multiply->input_value(1).get_node_shared_ptr());
+        if (!weight_convert || !scale) {
+            weight_convert = ov::as_type_ptr<ov::op::v0::Convert>(multiply->input_value(1).get_node_shared_ptr());
+            scale = ov::as_type_ptr<ov::op::v0::Constant>(multiply->input_value(0).get_node_shared_ptr());
+        }
+        if (!weight_convert || !scale ||
+            !ov::as_type_ptr<ov::op::v0::Constant>(weight_convert->input_value(0).get_node_shared_ptr())) {
+            return false;
+        }
+        scale_output = scale->output(0);
+
+        const auto weights = ov::as_type_ptr<ov::op::v0::Constant>(weight_convert->input_value(0).get_node_shared_ptr());
+        const auto weight_shape = weights->get_shape();
+        const auto scale_shape = scale->get_shape();
+        const auto coordinate_count = static_cast<size_t>(index_shape[2].get_length());
+        if ((weights->get_element_type() != ov::element::i8 && weights->get_element_type() != ov::element::u8) ||
+            weight_shape.size() != 3 || scale_shape.size() != 3 || weight_shape[0] != coordinate_count ||
+            weight_shape[1] != static_cast<size_t>(*depth) || weight_shape[2] == 0 || scale_shape[0] != weight_shape[0] ||
+            scale_shape[1] != 1 || scale_shape[2] != weight_shape[2] ||
+            weight_convert->get_destination_type() != scale->get_element_type() ||
+            table_convert->get_destination_type() != matmul_node->get_input_element_type(1) ||
+            one_hot_convert_node->get_destination_type() != matmul_node->get_input_element_type(0)) {
+            return false;
+        }
+
+        const auto index_type = indices.get_element_type();
+        const auto zero_index = ov::op::v0::Constant::create(index_type, ov::Shape{}, {0});
+        const auto max_index = ov::op::v0::Constant::create(index_type, ov::Shape{}, {*depth - 1});
+        const auto depth_index = ov::op::v0::Constant::create(index_type, ov::Shape{}, {*depth});
+        const auto gather_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {1});
+        const auto gather_order = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, {2, 0, 1});
+        const auto output_order = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {1, 0, 2, 3});
+        const auto mask_order = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, {0, 2, 1});
+        const auto unsqueeze_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+        const auto mask_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {3});
+
+        const auto non_negative = std::make_shared<ov::op::v1::GreaterEqual>(indices, zero_index);
+        const auto below_depth = std::make_shared<ov::op::v1::Less>(indices, depth_index);
+        const auto valid_indices = std::make_shared<ov::op::v1::LogicalAnd>(non_negative, below_depth);
+        const auto clamped_low = std::make_shared<ov::op::v1::Maximum>(indices, zero_index);
+        const auto clamped_indices = std::make_shared<ov::op::v1::Minimum>(clamped_low, max_index);
+        const auto gather_indices = std::make_shared<ov::op::v1::Transpose>(clamped_indices, gather_order);
+        const auto gathered_weights =
+            std::make_shared<ov::op::v8::Gather>(weights, gather_indices, gather_axis, 1);
+        const auto gathered_converted = std::make_shared<ov::op::v0::Convert>(gathered_weights, weight_convert->get_destination_type());
+        const auto expanded_scale = std::make_shared<ov::op::v0::Unsqueeze>(scale_output, unsqueeze_axis);
+        const auto dequantized = std::make_shared<ov::op::v1::Multiply>(gathered_converted, expanded_scale);
+        const auto table_type_values = std::make_shared<ov::op::v0::Convert>(dequantized, table_convert->get_destination_type());
+        const auto gathered = std::make_shared<ov::op::v1::Transpose>(table_type_values, output_order);
+        const auto mask_transpose = std::make_shared<ov::op::v1::Transpose>(valid_indices, mask_order);
+        const auto expanded_mask = std::make_shared<ov::op::v0::Unsqueeze>(mask_transpose, mask_axis);
+        const auto zero_value = ov::op::v0::Constant::create(table_convert->get_destination_type(), ov::Shape{}, {0.0f});
+        const auto masked = std::make_shared<ov::op::v1::Select>(expanded_mask, gathered, zero_value);
+
+        ov::NodeVector new_nodes;
+        const auto add_new_node = [&new_nodes](const auto& node) {
+            new_nodes.push_back(node);
+        };
+        add_new_node(zero_index);
+        add_new_node(max_index);
+        add_new_node(depth_index);
+        add_new_node(gather_axis);
+        add_new_node(gather_order);
+        add_new_node(output_order);
+        add_new_node(mask_order);
+        add_new_node(unsqueeze_axis);
+        add_new_node(mask_axis);
+        add_new_node(non_negative);
+        add_new_node(below_depth);
+        add_new_node(valid_indices);
+        add_new_node(clamped_low);
+        add_new_node(clamped_indices);
+        add_new_node(gather_indices);
+        add_new_node(gathered_weights);
+        add_new_node(gathered_converted);
+        add_new_node(expanded_scale);
+        add_new_node(dequantized);
+        add_new_node(table_type_values);
+        add_new_node(gathered);
+        add_new_node(mask_transpose);
+        add_new_node(expanded_mask);
+        add_new_node(zero_value);
+        add_new_node(masked);
+
+        ov::NodeVector source_nodes;
+        source_nodes.push_back(one_hot_node);
+        source_nodes.push_back(one_hot_convert_node);
+        source_nodes.push_back(transpose_node);
+        source_nodes.push_back(matmul_node);
+        source_nodes.push_back(table_convert);
+        source_nodes.push_back(multiply);
+        source_nodes.push_back(weight_convert);
+        source_nodes.push_back(weights);
+        source_nodes.push_back(scale);
+        ov::copy_runtime_info(source_nodes, new_nodes);
+        masked->set_friendly_name(matmul_node->get_friendly_name());
+        ov::replace_node(matmul_node, masked);
+        return true;
+    };
+
+    register_matcher(std::make_shared<ov::pass::pattern::Matcher>(matmul, matcher_name), callback);
+}
+
+}  // namespace pass
+
+bool run_npu_graph_transformations(const std::shared_ptr<ov::Model>& model) {
+    ov::pass::Manager manager;
+    manager.register_pass<pass::OneHotMatMulToGather>();
+    return manager.run_passes(model);
+}
 
 bool should_use_host_compile_interpreter(const std::shared_ptr<const ov::Model>& model,
                                          ov::intel_npu::CompilerType compilerType,
