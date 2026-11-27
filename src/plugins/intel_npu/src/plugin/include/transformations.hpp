@@ -19,6 +19,16 @@ namespace intel_npu {
 
 namespace pass {
 
+/**
+ * @brief Replaces a quantized OneHot/MatMul table lookup with a Gather on NPU.
+ *
+ * The rewrite accepts i32 indices, explicit i32-to-i64 widening, or i64 indices
+ * with depth at most 16384. For the latter, a coarse 0..32768 floating-point
+ * guard rejects narrowing overflow, while i32 comparisons check the exact depth
+ * and Gather retains i64 indices. The gap protects valid indices from FP16
+ * rounding at the coarse boundary. Other i64 lookups are left unchanged.
+ * Only finite, non-overflowing floating-point dequantization scales are supported.
+ */
 class OneHotMatMulToGather : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("intel_npu::pass::OneHotMatMulToGather");

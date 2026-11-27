@@ -5,6 +5,8 @@
 #include "transformations.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -27,6 +29,9 @@
 namespace intel_npu {
 
 namespace {
+
+constexpr int64_t MAX_GUARDED_I64_DEPTH = 16384;
+constexpr float I64_COARSE_GUARD_LIMIT = 32768.0f;
 
 std::optional<int64_t> get_integer_scalar(const ov::Output<ov::Node>& value) {
     const auto constant = ov::as_type_ptr<ov::op::v0::Constant>(value.get_node_shared_ptr());
@@ -57,10 +62,6 @@ std::optional<std::vector<int64_t>> get_integer_vector(const ov::Output<ov::Node
     return std::nullopt;
 }
 
-bool is_integer_index_type(const ov::element::Type& type) {
-    return type == ov::element::i32 || type == ov::element::i64;
-}
-
 }  // namespace
 
 namespace pass {
@@ -74,7 +75,7 @@ OneHotMatMulToGather::OneHotMatMulToGather() {
     const auto transpose = wrap_type<ov::op::v1::Transpose>({one_hot_convert, any_input()});
     const auto matmul = wrap_type<ov::op::v0::MatMul>({transpose, any_input()});
 
-    const ov::matcher_pass_callback callback = [one_hot, one_hot_convert, transpose](ov::pass::pattern::Matcher& matcher) {
+    const ov::matcher_pass_callback callback = [this, one_hot, one_hot_convert, transpose](ov::pass::pattern::Matcher& matcher) {
         const auto& pattern_map = matcher.get_pattern_value_map();
         const auto one_hot_node = ov::as_type_ptr<ov::op::v1::OneHot>(pattern_map.at(one_hot).get_node_shared_ptr());
         const auto one_hot_convert_node =
@@ -82,14 +83,26 @@ OneHotMatMulToGather::OneHotMatMulToGather() {
         const auto transpose_node =
             ov::as_type_ptr<ov::op::v1::Transpose>(pattern_map.at(transpose).get_node_shared_ptr());
         const auto matmul_node = ov::as_type_ptr<ov::op::v0::MatMul>(matcher.get_match_root());
+        if (transformation_callback(matmul_node)) {
+            return false;
+        }
 
         if (one_hot_node->get_axis() != 3 || matmul_node->get_transpose_a() || matmul_node->get_transpose_b()) {
             return false;
         }
 
-        const auto indices = one_hot_node->input_value(0);
+        auto indices = one_hot_node->input_value(0);
+        bool guarded_i64 = false;
+        if (indices.get_element_type() == ov::element::i64) {
+            const auto widening = ov::as_type_ptr<ov::op::v0::Convert>(indices.get_node_shared_ptr());
+            if (widening && widening->input_value(0).get_element_type() == ov::element::i32) {
+                indices = widening->input_value(0);
+            } else {
+                guarded_i64 = true;
+            }
+        }
         const auto index_shape = indices.get_partial_shape();
-        if (!is_integer_index_type(indices.get_element_type()) || !index_shape.rank().is_static() ||
+        if ((indices.get_element_type() != ov::element::i32 && !guarded_i64) || !index_shape.rank().is_static() ||
             index_shape.rank().get_length() != 3 || !index_shape[2].is_static()) {
             return false;
         }
@@ -97,7 +110,8 @@ OneHotMatMulToGather::OneHotMatMulToGather() {
         const auto depth = get_integer_scalar(one_hot_node->input_value(1));
         const auto on_value = get_integer_scalar(one_hot_node->input_value(2));
         const auto off_value = get_integer_scalar(one_hot_node->input_value(3));
-        if (!depth || !on_value || !off_value || *depth <= 0 || *on_value != 1 || *off_value != 0) {
+        if (!depth || !on_value || !off_value || *depth <= 0 || *depth > std::numeric_limits<int32_t>::max() ||
+            (guarded_i64 && *depth > MAX_GUARDED_I64_DEPTH) || *on_value != 1 || *off_value != 0) {
             return false;
         }
 
@@ -143,11 +157,29 @@ OneHotMatMulToGather::OneHotMatMulToGather() {
             one_hot_convert_node->get_destination_type() != matmul_node->get_input_element_type(0)) {
             return false;
         }
+        const auto dequant_type = weight_convert->get_destination_type();
+        const auto table_type = table_convert->get_destination_type();
+        if ((dequant_type != ov::element::f16 && dequant_type != ov::element::f32) ||
+            (table_type != ov::element::f16 && table_type != ov::element::f32)) {
+            return false;
+        }
+        const float max_finite = std::min(dequant_type == ov::element::f16
+                                              ? static_cast<float>(std::numeric_limits<ov::float16>::max())
+                                              : std::numeric_limits<float>::max(),
+                                          table_type == ov::element::f16
+                                              ? static_cast<float>(std::numeric_limits<ov::float16>::max())
+                                              : std::numeric_limits<float>::max());
+        const float max_weight = weights->get_element_type() == ov::element::i8 ? 128.0f : 255.0f;
+        for (const float value : scale->cast_vector<float>()) {
+            if (!std::isfinite(value) || std::abs(value) > max_finite / max_weight) {
+                return false;
+            }
+        }
 
         const auto index_type = indices.get_element_type();
         const auto zero_index = ov::op::v0::Constant::create(index_type, ov::Shape{}, {0});
-        const auto max_index = ov::op::v0::Constant::create(index_type, ov::Shape{}, {*depth - 1});
-        const auto depth_index = ov::op::v0::Constant::create(index_type, ov::Shape{}, {*depth});
+        const auto zero_i32 = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{}, {0});
+        const auto depth_index = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{}, {*depth});
         const auto gather_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {1});
         const auto gather_order = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, {2, 0, 1});
         const auto output_order = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {1, 0, 2, 3});
@@ -155,12 +187,25 @@ OneHotMatMulToGather::OneHotMatMulToGather() {
         const auto unsqueeze_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
         const auto mask_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {3});
 
-        const auto non_negative = std::make_shared<ov::op::v1::GreaterEqual>(indices, zero_index);
-        const auto below_depth = std::make_shared<ov::op::v1::Less>(indices, depth_index);
-        const auto valid_indices = std::make_shared<ov::op::v1::LogicalAnd>(non_negative, below_depth);
-        const auto clamped_low = std::make_shared<ov::op::v1::Maximum>(indices, zero_index);
-        const auto clamped_indices = std::make_shared<ov::op::v1::Minimum>(clamped_low, max_index);
-        const auto gather_indices = std::make_shared<ov::op::v1::Transpose>(clamped_indices, gather_order);
+        const auto narrowed = guarded_i64 ? std::make_shared<ov::op::v0::Convert>(indices, ov::element::i32) : nullptr;
+        const ov::Output<ov::Node> bounded_indices = narrowed ? narrowed->output(0) : indices;
+        const auto non_negative = std::make_shared<ov::op::v1::GreaterEqual>(bounded_indices, zero_i32);
+        const auto below_depth = std::make_shared<ov::op::v1::Less>(bounded_indices, depth_index);
+        const auto bounded_valid = std::make_shared<ov::op::v1::LogicalAnd>(non_negative, below_depth);
+        auto valid_indices = bounded_valid;
+        ov::NodeVector guard_nodes;
+        if (guarded_i64) {
+            const auto as_float = std::make_shared<ov::op::v0::Convert>(indices, ov::element::f32);
+            const auto float_zero = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {0.0f});
+            const auto coarse_limit = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {I64_COARSE_GUARD_LIMIT});
+            const auto coarse_non_negative = std::make_shared<ov::op::v1::GreaterEqual>(as_float, float_zero);
+            const auto coarse_below_limit = std::make_shared<ov::op::v1::Less>(as_float, coarse_limit);
+            const auto coarse_valid = std::make_shared<ov::op::v1::LogicalAnd>(coarse_non_negative, coarse_below_limit);
+            valid_indices = std::make_shared<ov::op::v1::LogicalAnd>(valid_indices, coarse_valid);
+            guard_nodes = {narrowed, as_float, float_zero, coarse_limit, coarse_non_negative, coarse_below_limit, coarse_valid};
+        }
+        const auto safe_indices = std::make_shared<ov::op::v1::Select>(valid_indices, indices, zero_index);
+        const auto gather_indices = std::make_shared<ov::op::v1::Transpose>(safe_indices, gather_order);
         const auto gathered_weights =
             std::make_shared<ov::op::v8::Gather>(weights, gather_indices, gather_axis, 1);
         const auto gathered_converted = std::make_shared<ov::op::v0::Convert>(gathered_weights, weight_convert->get_destination_type());
@@ -178,7 +223,7 @@ OneHotMatMulToGather::OneHotMatMulToGather() {
             new_nodes.push_back(node);
         };
         add_new_node(zero_index);
-        add_new_node(max_index);
+        add_new_node(zero_i32);
         add_new_node(depth_index);
         add_new_node(gather_axis);
         add_new_node(gather_order);
@@ -188,9 +233,12 @@ OneHotMatMulToGather::OneHotMatMulToGather() {
         add_new_node(mask_axis);
         add_new_node(non_negative);
         add_new_node(below_depth);
-        add_new_node(valid_indices);
-        add_new_node(clamped_low);
-        add_new_node(clamped_indices);
+        add_new_node(bounded_valid);
+        if (guarded_i64) {
+            add_new_node(valid_indices);
+        }
+        new_nodes.insert(new_nodes.end(), guard_nodes.begin(), guard_nodes.end());
+        add_new_node(safe_indices);
         add_new_node(gather_indices);
         add_new_node(gathered_weights);
         add_new_node(gathered_converted);
